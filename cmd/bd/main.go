@@ -108,32 +108,6 @@ var (
 	commandSpan oteltrace.Span
 )
 
-// readOnlyCommands lists commands that only read from the database.
-// These commands open the store in read-only mode. See GH#804.
-var readOnlyCommands = map[string]bool{
-	"list":       true,
-	"ready":      true,
-	"show":       true,
-	"stats":      true,
-	"blocked":    true,
-	"count":      true,
-	"search":     true,
-	"graph":      true,
-	"duplicates": true,
-	"comments":   true, // list comments (not add)
-	"current":    true, // bd sync mode current
-	"ping":       true,
-	"backup":     true, // reads from Dolt, writes only to .beads/backup/
-	"export":     true, // reads from Dolt, writes JSONL to file/stdout
-}
-
-// isReadOnlyCommand returns true if the command only reads from the database.
-// This is used to open the store in read-only mode, preventing file modifications
-// that would trigger file watchers. See GH#804.
-func isReadOnlyCommand(cmdName string) bool {
-	return readOnlyCommands[cmdName]
-}
-
 // loadBeadsEnvFile loads .beads/.env into process environment for per-project
 // Dolt credentials (GH#2520). Uses gotenv.Load which is non-overriding —
 // existing shell env vars always take precedence.
@@ -1115,8 +1089,13 @@ var rootCmd = &cobra.Command{
 			}
 
 			// Tip metadata auto-commit: if a tip was shown, create a separate Dolt commit for the
-			// tip_*_last_shown metadata updates. This may happen even for otherwise read-only commands.
-			if commandDidWriteTipMetadata && len(commandTipIDsShown) > 0 {
+			// tip_*_last_shown metadata updates.
+			//
+			// READ_ONLY commands (Layer 1 contract) skip this fast path: pending tip
+			// writes accumulate in the working set and ride along on the next mutating
+			// command's commit. This keeps `bd ready / list / show / search` free of
+			// DOLT_COMMIT calls — see be-y9p for the dispatcher-level rationale.
+			if commandDidWriteTipMetadata && len(commandTipIDsShown) > 0 && commandIntentFor(cmd) != IntentReadOnly {
 				// Only applies when dolt auto-commit is enabled and backend is versioned (Dolt).
 				if mode, err := getDoltAutoCommitMode(); err != nil {
 					FatalError("dolt tip auto-commit failed: %v", err)

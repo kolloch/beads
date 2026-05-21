@@ -170,5 +170,4 @@ func printContextText(info ContextInfo) {
 
 func init() {
 	rootCmd.AddCommand(contextCmd)
-	readOnlyCommands["context"] = true
 }
