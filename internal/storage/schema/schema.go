@@ -87,7 +87,58 @@ func parseVersion(name string) (int, error) {
 	return strconv.Atoi(parts[0])
 }
 
+// SchemaSkewError reports that the database has been migrated to a schema
+// version newer than this bd binary understands. The binary's embedded queries
+// assume the older schema, so proceeding would surface as cryptic
+// column-not-found SQL errors instead of an actionable message (see be-930,
+// where a stale binary hit a dropped generated column on every dependency
+// query). Callers should treat this as fatal: the only fix is upgrading bd.
+type SchemaSkewError struct {
+	// DBVersion is the highest migration version recorded in the database.
+	DBVersion int
+	// BinaryVersion is the highest migration version this binary embeds.
+	BinaryVersion int
+}
+
+func (e *SchemaSkewError) Error() string {
+	return fmt.Sprintf(
+		"database schema (v%d) is newer than this bd binary (knows migrations up to v%d): "+
+			"your bd binary is out of date — rebuild or reinstall bd to match the database schema",
+		e.DBVersion, e.BinaryVersion,
+	)
+}
+
+// checkBinaryNotBehindDB fails fast when this source's version recorded in the
+// database is newer than the highest migration the binary embeds for it. This
+// is the binary-older-than-DB skew: MigrateUp's "already at latest" early
+// return would otherwise let an out-of-date binary run queries against a schema
+// it does not understand, producing cryptic SQL errors (be-930).
+//
+// A query error is treated as "no recorded version" (e.g. a fresh database
+// whose cursor table does not exist yet) — that is not skew; migrate() creates
+// the table.
+func (m migrationSource) checkBinaryNotBehindDB(ctx context.Context, db DBConn) error {
+	var dbVersion int
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM "+m.cursorTable).Scan(&dbVersion); err != nil {
+		return nil
+	}
+	if binaryVersion := m.latest(); dbVersion > binaryVersion {
+		return &SchemaSkewError{DBVersion: dbVersion, BinaryVersion: binaryVersion}
+	}
+	return nil
+}
+
 func MigrateUp(ctx context.Context, db DBConn) (int, error) {
+	// Detect binary-older-than-DB skew before the at-latest early return below:
+	// when the DB has migrations this binary lacks, atLatest reports true and we
+	// would silently proceed to run queries against an unknown schema. Only the
+	// main schema_migrations cursor is guarded — that is the drift that produced
+	// be-930's dropped-column errors. The inverse (binary newer than DB) is the
+	// normal migrate path handled below.
+	if err := mainSource.checkBinaryNotBehindDB(ctx, db); err != nil {
+		return 0, err
+	}
+
 	if mainSource.atLatest(ctx, db) && ignoredSource.atLatest(ctx, db) {
 		return 0, nil
 	}

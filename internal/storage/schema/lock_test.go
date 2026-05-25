@@ -101,6 +101,9 @@ func expectOnePendingMigration(t *testing.T, mock sqlmock.Sqlmock) {
 	latest := LatestVersion()
 	latestIgnored := LatestIgnoredVersion()
 
+	// MigrateUp's leading skew check (checkBinaryNotBehindDB): DB at latest-1 is
+	// behind the binary, not ahead, so it passes and migration proceeds.
+	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
 	expectScalar(mock, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations", "version", latest-1)
 	mock.ExpectExec("(?s)^CREATE TABLE IF NOT EXISTS schema_migrations").
 		WillReturnResult(sqlmock.NewResult(0, 0))
