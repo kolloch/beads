@@ -2,6 +2,8 @@ package dolt
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,18 +85,26 @@ func TestPullWithAutoResolve_BranchTrackingFallbackSuccess(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
+	// Remotes are DATABASE-scoped, not branch-scoped, so setupTestStore's
+	// branch-per-test isolation does NOT isolate them. A hard-coded "origin"
+	// collides with the remote that store bootstrap registers on the shared
+	// test database (New -> syncCLIRemotesToSQL re-registers CLI remotes),
+	// failing the add with "remote already exists". Use a per-test name so
+	// this test stays isolated without removing remotes other parallel tests
+	// may rely on (be-r82).
+	remoteName := uniqueRemoteName(t)
 	remoteURL := "file://" + remoteDir
-	if _, err := store.db.ExecContext(ctx, "CALL DOLT_REMOTE('add', 'origin', ?)", remoteURL); err != nil {
+	if _, err := store.db.ExecContext(ctx, "CALL DOLT_REMOTE('add', ?, ?)", remoteName, remoteURL); err != nil {
 		t.Fatalf("add remote via DOLT_REMOTE: %v", err)
 	}
-	store.remote = "origin"
+	store.remote = remoteName
 	store.branch = "main"
 
 	tx, txErr := store.db.BeginTx(ctx, nil)
 	if txErr != nil {
 		t.Fatalf("begin tx for raw pull check: %v", txErr)
 	}
-	_, rawPullErr := tx.ExecContext(ctx, "CALL DOLT_PULL(?, ?)", "origin", "main")
+	_, rawPullErr := tx.ExecContext(ctx, "CALL DOLT_PULL(?, ?)", remoteName, "main")
 	_ = tx.Rollback()
 	if rawPullErr == nil {
 		t.Skip("DOLT_PULL succeeded without tracking config; fallback path is not needed for this Dolt version")
@@ -103,7 +113,7 @@ func TestPullWithAutoResolve_BranchTrackingFallbackSuccess(t *testing.T) {
 		t.Skipf("DOLT_PULL failed with an unexpected non-tracking error: %v", rawPullErr)
 	}
 
-	if err := store.pullWithAutoResolve(ctx, "CALL DOLT_PULL(?, ?)", "origin", "main"); err != nil {
+	if err := store.pullWithAutoResolve(ctx, "CALL DOLT_PULL(?, ?)", remoteName, "main"); err != nil {
 		t.Fatalf("pullWithAutoResolve fallback failed: %v", err)
 	}
 
@@ -132,4 +142,18 @@ func runDoltSQLForBranchTracking(t *testing.T, dir, query string) {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("dolt sql failed in %s: %v\nQuery: %.200s...\n%s", dir, err, query, output)
 	}
+}
+
+// uniqueRemoteName returns a Dolt remote name unique to this test run. Dolt
+// remotes live in the database-scoped dolt_remotes table, so the shared test
+// database (setupTestStore isolates only via branch-per-test) can already hold
+// an "origin" remote before a test registers its own. A per-test name avoids
+// that collision without disturbing remotes other parallel tests may use.
+func uniqueRemoteName(t *testing.T) string {
+	t.Helper()
+	buf := make([]byte, 6)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("failed to generate random bytes: %v", err)
+	}
+	return "br_track_" + hex.EncodeToString(buf)
 }
