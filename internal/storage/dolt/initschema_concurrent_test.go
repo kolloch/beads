@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/schema"
@@ -76,7 +77,7 @@ func TestConcurrentInitSchema(t *testing.T) {
 
 			<-ready // wait for all goroutines to be ready
 
-			if err := initSchemaOnDB(ctx, db); err != nil {
+			if err := initSchemaWithRetry(ctx, db); err != nil {
 				errs <- fmt.Errorf("goroutine %d: initSchemaOnDB: %w", n, err)
 			}
 		}(i)
@@ -118,6 +119,36 @@ func TestConcurrentInitSchema(t *testing.T) {
 			t.Errorf("table %s missing after concurrent init", table)
 		}
 	}
+}
+
+// initSchemaWithRetry runs initSchemaOnDB with the same migration-lock retry
+// budget that every production caller wraps around schema init — see
+// uow.doltServerProvider.initSchema (backoff.Retry on schema.IsMigrationLockError)
+// and DoltStore.withRetry/isRetryableError. The per-database migration lock has a
+// deliberately short GET_LOCK acquire timeout (schema.migrationLockAcquireTimeoutSeconds,
+// 5s) tuned to sit below those retry budgets, so a lost lock race surfaces as a
+// retryable ErrMigrationLockUnavailable rather than a hard failure.
+//
+// TestConcurrentInitSchema's goroutines each "simulate a separate bd process
+// connecting simultaneously", but a real bd process retries on lock contention.
+// Calling initSchemaOnDB directly gave the goroutines no retry budget, so under
+// full dolt-suite container load a trailing goroutine's 5s GET_LOCK wait could be
+// exceeded while the lock holder migrated, failing the test spuriously (be-w54).
+// Retrying with the production budget (serverRetryMaxElapsed) makes each goroutine
+// faithfully model a real caller without weakening the production timeout.
+func initSchemaWithRetry(ctx context.Context, db *sql.DB) error {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = serverRetryMaxElapsed
+	return backoff.Retry(func() error {
+		err := initSchemaOnDB(ctx, db)
+		if err != nil && schema.IsMigrationLockError(err) {
+			return err // retryable: lost the lock race under load, try again
+		}
+		if err != nil {
+			return backoff.Permanent(err) // schema corruption etc.: fail fast
+		}
+		return nil
+	}, backoff.WithContext(bo, ctx))
 }
 
 func TestInitSchemaBlocksOnMigrationLock(t *testing.T) {
