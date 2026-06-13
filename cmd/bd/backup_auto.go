@@ -78,6 +78,12 @@ func maybeAutoBackup(ctx context.Context) {
 
 	// Run the backup (force=true since we already checked change detection above)
 	if _, err := runBackupExport(ctx, true); err != nil {
+		// Persist the throttle even on failure so a transient error (e.g. a
+		// concurrent backup race against a shared sql-server) does not make
+		// every subsequent bd mutation re-attempt the backup — the warning
+		// storm be-lee fixes. The commit watermark is untouched, so the backup
+		// is retried after the throttle interval, not abandoned.
+		touchBackupThrottle(dir)
 		if !isQuiet() && !jsonOutput {
 			fmt.Fprintf(os.Stderr, "Warning: auto-backup failed: %v\n", err)
 		}

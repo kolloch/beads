@@ -723,12 +723,18 @@ func (s *DoltStore) BackupDatabase(ctx context.Context, dir string) error {
 	}
 	backupName := "backup_export"
 
-	// Register as a backup remote (idempotent — remove first if exists).
-	_ = versioncontrolops.BackupRemove(ctx, s.db, backupName)
-	if err := versioncontrolops.BackupAdd(ctx, s.db, backupName, backupURL); err != nil {
-		// Another backup (e.g. "default" registered by `bd backup init`) may
-		// already point to this URL. In that case, sync using the existing
-		// remote name rather than failing.
+	// Register as a backup remote. backup_export is a single global remote on
+	// the (possibly shared) sql-server, so concurrent bd processes race on it.
+	// The remove stays best-effort — it only clears a possibly-stale URL — and
+	// the add is idempotent: when a peer already created the remote ("already
+	// exists") we fall through and sync the existing one. Without the idempotent
+	// add the loser of the race fails the whole backup, never persists its
+	// throttle, and re-attempts on every mutation — a warning storm. See be-lee.
+	_ = versioncontrolops.BackupRemoveIfExists(ctx, s.db, backupName)
+	if err := versioncontrolops.BackupAddIfNotExists(ctx, s.db, backupName, backupURL); err != nil {
+		// A *different* backup (e.g. "default" registered by `bd backup init`)
+		// may already point to this URL. In that case backup_export was not
+		// created, so sync using the existing remote name rather than failing.
 		if conflict := versioncontrolops.ExtractAddressConflictName(err); conflict != "" {
 			if syncErr := versioncontrolops.BackupSync(ctx, s.db, conflict); syncErr != nil {
 				return fmt.Errorf("sync to backup: %w", syncErr)

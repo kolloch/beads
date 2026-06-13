@@ -318,12 +318,15 @@ func (s *EmbeddedDoltStore) BackupDatabase(ctx context.Context, dir string) erro
 	backupName := "backup_export"
 
 	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		// Register as a backup remote (idempotent — remove first if exists).
-		_ = versioncontrolops.BackupRemove(ctx, db, backupName)
-		if err := versioncontrolops.BackupAdd(ctx, db, backupName, backupURL); err != nil {
-			// Another backup (e.g. "default" registered by `bd backup init`) may
-			// already point to this URL. In that case, sync using the existing
-			// remote name rather than failing.
+		// Register as a backup remote. Best-effort remove + idempotent add so
+		// concurrent bd processes racing on this single global remote don't fail
+		// the backup (and then re-attempt on every mutation). See be-lee and the
+		// matching comment on DoltStore.BackupDatabase.
+		_ = versioncontrolops.BackupRemoveIfExists(ctx, db, backupName)
+		if err := versioncontrolops.BackupAddIfNotExists(ctx, db, backupName, backupURL); err != nil {
+			// A *different* backup (e.g. "default" registered by `bd backup
+			// init`) may already point to this URL. In that case backup_export
+			// was not created, so sync using the existing remote name.
 			if conflict := versioncontrolops.ExtractAddressConflictName(err); conflict != "" {
 				if syncErr := versioncontrolops.BackupSync(ctx, db, conflict); syncErr != nil {
 					return fmt.Errorf("sync to backup: %w", syncErr)

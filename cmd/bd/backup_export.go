@@ -79,6 +79,24 @@ func saveBackupState(dir string, state *backupState) error {
 	return atomicWriteFile(filepath.Join(dir, "backup_state.json"), data)
 }
 
+// touchBackupThrottle persists only the throttle timestamp, leaving the
+// change-detection watermark (LastDoltCommit) untouched. It is called after a
+// failed auto-backup so a transient failure does not make every subsequent bd
+// mutation re-attempt the backup. Because LastDoltCommit is preserved, the
+// backup is retried after the throttle interval (when the commit still differs),
+// not abandoned. Best-effort: any error is logged and swallowed.
+func touchBackupThrottle(dir string) {
+	state, err := loadBackupState(dir)
+	if err != nil {
+		debug.Logf("backup: failed to load state to persist throttle: %v\n", err)
+		return
+	}
+	state.Timestamp = time.Now().UTC()
+	if err := saveBackupState(dir, state); err != nil {
+		debug.Logf("backup: failed to persist throttle after failure: %v\n", err)
+	}
+}
+
 // atomicWriteFile writes data to a temp file and renames it into place (crash-safe).
 func atomicWriteFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
