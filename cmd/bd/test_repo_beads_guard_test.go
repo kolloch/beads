@@ -76,6 +76,20 @@ func testMainInner(m *testing.M) int {
 
 	// BD_BRANCH is no longer used (all writers operate on main with transactions).
 
+	// Clear any ambient Dolt port env vars before the shared test Dolt server
+	// starts. startTestDoltServer (the CGO hook below) records the isolated test
+	// container's port and connects to it explicitly in initCmdBDSharedSchema.
+	// applyConfigDefaults lets a set BEADS_DOLT_SERVER_PORT (or legacy
+	// BEADS_DOLT_PORT) override that explicit port, so an ambient value — e.g.
+	// the city/production Dolt server in a gc session (BEADS_DOLT_SERVER_PORT=
+	// 50215) — would silently redirect shared schema init off the container and
+	// onto that server, where cmdbd_pkg_shared doesn't exist, and leak testdb_*
+	// databases onto prod. Unsetting here (and restoring nothing — tests want the
+	// container port) makes the container authoritative for the whole package.
+	// Matches be-n09's fix for internal/storage/dolt TestMain.
+	os.Unsetenv("BEADS_DOLT_SERVER_PORT")
+	os.Unsetenv("BEADS_DOLT_PORT")
+
 	// Start shared test Dolt server if the hook is registered (CGO builds).
 	// This must happen after HOME is changed so dolt config goes to the temp dir.
 	if beforeTestsHook != nil {

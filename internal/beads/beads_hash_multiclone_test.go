@@ -24,6 +24,17 @@ var testDoltPort int
 func TestMain(m *testing.M) {
 	os.Setenv("BEADS_TEST_MODE", "1")
 
+	// Clear any ambient Dolt port env vars before container setup. testDoltPort
+	// (the isolated test container) is what these integration tests and the bd
+	// subprocesses they spawn must use. applyConfigDefaults lets a set
+	// BEADS_DOLT_SERVER_PORT (or legacy BEADS_DOLT_PORT) override an explicit
+	// port, so an ambient value — e.g. the city/production Dolt server in a gc
+	// session — would silently redirect tests (and inheriting subprocesses) onto
+	// that server. Unsetting here makes testDoltPort authoritative (matches
+	// be-n09's fix for internal/storage/dolt TestMain).
+	os.Unsetenv("BEADS_DOLT_SERVER_PORT")
+	os.Unsetenv("BEADS_DOLT_PORT")
+
 	// Start an isolated Dolt server so integration tests don't hit production.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
@@ -69,6 +80,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	os.RemoveAll(tmpDir)
+	os.Unsetenv("BEADS_DOLT_SERVER_PORT")
 	os.Unsetenv("BEADS_DOLT_PORT")
 	os.Unsetenv("BEADS_TEST_MODE")
 	os.Exit(code)
