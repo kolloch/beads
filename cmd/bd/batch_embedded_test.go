@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -102,6 +103,85 @@ dep add tb-3 tb-2
 	}
 	if !found {
 		t.Errorf("expected tb-3 to depend on tb-2, got %+v", deps)
+	}
+}
+
+// TestBatch_UpdateLabelsMetadataNotes exercises the extended `update` grammar:
+// add-label, remove-label, set-metadata, unset-metadata, and append-notes all
+// applied inside a single batch transaction. It verifies merge semantics
+// (existing metadata keys and labels are preserved/dropped, notes are appended)
+// rather than clobbered.
+func TestBatch_UpdateLabelsMetadataNotes(t *testing.T) {
+	tmpDir := t.TempDir()
+	st := newTestStoreWithPrefix(t, filepath.Join(tmpDir, ".beads", "beads.db"), "tbm")
+	ctx := context.Background()
+
+	// Seed an issue with an existing label, metadata, and notes so the test
+	// proves add/remove, set/unset merge, and notes-append behavior.
+	issue := &types.Issue{
+		ID:        "tbm-1",
+		Title:     "seed tbm-1",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Notes:     "existing note",
+		Metadata:  json.RawMessage(`{"keep":"yes","drop":"old"}`),
+	}
+	if err := st.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("seed CreateIssue: %v", err)
+	}
+	if err := st.AddLabel(ctx, "tbm-1", "stale", "test"); err != nil {
+		t.Fatalf("seed AddLabel: %v", err)
+	}
+
+	// Note: the appended note is double-quoted so its space survives tokenization;
+	// set-metadata's value is itself a key=value pair (split on the first '=').
+	script := `update tbm-1 add-label=dolt add-label=ops remove-label=stale set-metadata=gc.routed_to=gascity/gastown.polecat unset-metadata=drop append-notes="batched update"
+`
+	if err := runBatchScriptInTx(t, ctx, st, script); err != nil {
+		t.Fatalf("batch run: %v", err)
+	}
+
+	got, err := st.GetIssue(ctx, "tbm-1")
+	if err != nil {
+		t.Fatalf("GetIssue tbm-1: %v", err)
+	}
+
+	// append-notes joins with a newline and preserves the existing note.
+	wantNotes := "existing note\nbatched update"
+	if got.Notes != wantNotes {
+		t.Errorf("notes = %q, want %q", got.Notes, wantNotes)
+	}
+
+	// Metadata merge: untouched key preserved, new key set, unset key removed.
+	var meta map[string]interface{}
+	if err := json.Unmarshal(got.Metadata, &meta); err != nil {
+		t.Fatalf("unmarshal metadata %q: %v", got.Metadata, err)
+	}
+	if meta["keep"] != "yes" {
+		t.Errorf("metadata keep = %v, want yes (untouched key dropped)", meta["keep"])
+	}
+	if meta["gc.routed_to"] != "gascity/gastown.polecat" {
+		t.Errorf("metadata gc.routed_to = %v, want gascity/gastown.polecat", meta["gc.routed_to"])
+	}
+	if _, ok := meta["drop"]; ok {
+		t.Errorf("metadata still has unset key 'drop': %v", meta)
+	}
+
+	// Labels: add-label additions present, remove-label removal gone.
+	labels, err := st.GetLabels(ctx, "tbm-1")
+	if err != nil {
+		t.Fatalf("GetLabels tbm-1: %v", err)
+	}
+	labelSet := make(map[string]bool, len(labels))
+	for _, l := range labels {
+		labelSet[l] = true
+	}
+	if !labelSet["dolt"] || !labelSet["ops"] {
+		t.Errorf("labels missing dolt/ops: %v", labels)
+	}
+	if labelSet["stale"] {
+		t.Errorf("label 'stale' should have been removed: %v", labels)
 	}
 }
 

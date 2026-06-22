@@ -198,26 +198,59 @@ func TestParseBatchScript_UnterminatedQuote(t *testing.T) {
 }
 
 func TestParseUpdateKVs(t *testing.T) {
+	sp := func(s string) *string { return &s }
 	tests := []struct {
 		name    string
 		in      []string
-		want    map[string]interface{}
+		want    *batchUpdate
 		wantErr bool
 	}{
 		{
 			name: "status and priority",
 			in:   []string{"status=in_progress", "priority=1"},
-			want: map[string]interface{}{"status": "in_progress", "priority": 1},
+			want: &batchUpdate{fields: map[string]interface{}{"status": "in_progress", "priority": 1}},
 		},
 		{
 			name: "title",
 			in:   []string{"title=new title"},
-			want: map[string]interface{}{"title": "new title"},
+			want: &batchUpdate{fields: map[string]interface{}{"title": "new title"}},
 		},
 		{
 			name: "assignee blank allowed (unassign)",
 			in:   []string{"assignee="},
-			want: map[string]interface{}{"assignee": ""},
+			want: &batchUpdate{fields: map[string]interface{}{"assignee": ""}},
+		},
+		{
+			name: "add and remove labels accumulate in order",
+			in:   []string{"add-label=dolt", "add-label=ops", "remove-label=stale"},
+			want: &batchUpdate{
+				fields:       map[string]interface{}{},
+				addLabels:    []string{"dolt", "ops"},
+				removeLabels: []string{"stale"},
+			},
+		},
+		{
+			name: "set and unset metadata defer value parsing",
+			in:   []string{"set-metadata=gc.routed_to=gascity/x", "unset-metadata=old"},
+			want: &batchUpdate{
+				fields:        map[string]interface{}{},
+				setMetadata:   []string{"gc.routed_to=gascity/x"},
+				unsetMetadata: []string{"old"},
+			},
+		},
+		{
+			name: "append-notes preserves spaces",
+			in:   []string{"append-notes=hello world"},
+			want: &batchUpdate{fields: map[string]interface{}{}, appendNotes: sp("hello world")},
+		},
+		{
+			name: "mixed regular fields and ops",
+			in:   []string{"status=open", "add-label=x", "set-metadata=k=v"},
+			want: &batchUpdate{
+				fields:      map[string]interface{}{"status": "open"},
+				addLabels:   []string{"x"},
+				setMetadata: []string{"k=v"},
+			},
 		},
 		{
 			name:    "unsupported key",
@@ -244,6 +277,21 @@ func TestParseUpdateKVs(t *testing.T) {
 			in:      []string{"title="},
 			wantErr: true,
 		},
+		{
+			name:    "empty add-label",
+			in:      []string{"add-label="},
+			wantErr: true,
+		},
+		{
+			name:    "empty remove-label",
+			in:      []string{"remove-label="},
+			wantErr: true,
+		},
+		{
+			name:    "empty unset-metadata key",
+			in:      []string{"unset-metadata="},
+			wantErr: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -255,7 +303,7 @@ func TestParseUpdateKVs(t *testing.T) {
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseUpdateKVs = %v, want %v", got, tt.want)
+				t.Errorf("parseUpdateKVs = %+v, want %+v", got, tt.want)
 			}
 		})
 	}

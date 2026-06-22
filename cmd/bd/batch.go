@@ -50,7 +50,12 @@ Grammar (one command per line):
   dep remove <from-id> <to-id>
   #comment  (blank lines and '# ...' comments are ignored)
 
-Supported 'update' keys: status, priority, title, assignee
+Supported 'update' keys: status, priority, title, assignee,
+  add-label, remove-label, set-metadata, unset-metadata, append-notes
+  - add-label/remove-label and set-metadata/unset-metadata are repeatable
+  - set-metadata takes key=value, e.g. set-metadata=gc.routed_to=rig/agent
+  - unset-metadata takes the metadata key to delete
+  - append-notes appends to existing notes (quote values containing spaces)
 Supported dependency types: see 'bd dep add --help' (default: blocks)
 
 Tokens are whitespace-separated. Double-quoted strings ("like this") may
@@ -340,12 +345,52 @@ func runBatchOp(ctx context.Context, tx storage.Transaction, op batchOp) (batchO
 			return result, fmt.Errorf("update requires <id> and at least one key=value")
 		}
 		id := op.args[0]
-		updates, err := parseUpdateKVs(op.args[1:])
+		bu, err := parseUpdateKVs(op.args[1:])
 		if err != nil {
 			return result, err
 		}
-		if err := tx.UpdateIssue(ctx, id, updates, actorName); err != nil {
-			return result, err
+		// Metadata edits and append-notes are read-modify-write: fetch the
+		// current issue once and fold both into the field updates so they ride
+		// the same UpdateIssue call (mirrors the single `bd update` path).
+		if len(bu.setMetadata) > 0 || len(bu.unsetMetadata) > 0 || bu.appendNotes != nil {
+			issue, err := tx.GetIssue(ctx, id)
+			if err != nil {
+				return result, err
+			}
+			if issue == nil {
+				return result, fmt.Errorf("update: issue %q not found", id)
+			}
+			if len(bu.setMetadata) > 0 || len(bu.unsetMetadata) > 0 {
+				merged, err := applyMetadataEdits(issue.Metadata, bu.setMetadata, bu.unsetMetadata)
+				if err != nil {
+					return result, err
+				}
+				bu.fields["metadata"] = merged
+			}
+			if bu.appendNotes != nil {
+				combined := issue.Notes
+				if combined != "" {
+					combined += "\n"
+				}
+				combined += *bu.appendNotes
+				bu.fields["notes"] = combined
+			}
+		}
+		if len(bu.fields) > 0 {
+			if err := tx.UpdateIssue(ctx, id, bu.fields, actorName); err != nil {
+				return result, err
+			}
+		}
+		// Labels use dedicated transaction methods (no updates-map equivalent).
+		for _, label := range bu.addLabels {
+			if err := tx.AddLabel(ctx, id, label, actorName); err != nil {
+				return result, err
+			}
+		}
+		for _, label := range bu.removeLabels {
+			if err := tx.RemoveLabel(ctx, id, label, actorName); err != nil {
+				return result, err
+			}
 		}
 		result.Target = id
 		return result, nil
@@ -419,12 +464,30 @@ func runBatchOp(ctx context.Context, tx storage.Transaction, op batchOp) (batchO
 	return result, fmt.Errorf("internal: unhandled batch op %q", op.cmd)
 }
 
-// parseUpdateKVs walks a slice of "key=value" tokens and builds the updates
-// map accepted by storage.Transaction.UpdateIssue. Only a small, documented
-// subset of fields is allowed — anything else is a hard error so typos in
-// scripts never silently drop updates.
-func parseUpdateKVs(kvs []string) (map[string]interface{}, error) {
-	updates := make(map[string]interface{}, len(kvs))
+// batchUpdate is the structured result of parsing an `update` op's key=value
+// tokens. Plain column writes (status/priority/title/assignee) live in fields
+// and are applied via storage.Transaction.UpdateIssue; label and metadata/notes
+// mutations need dedicated transaction methods or a read-modify-write against
+// the current issue, so they are tracked separately. This mirrors the single
+// `bd update` command's split between regularUpdates and label/metadata/notes
+// handling.
+type batchUpdate struct {
+	fields        map[string]interface{} // status, priority, title, assignee
+	addLabels     []string               // applied via Transaction.AddLabel
+	removeLabels  []string               // applied via Transaction.RemoveLabel
+	setMetadata   []string               // raw "key=value" pairs for applyMetadataEdits
+	unsetMetadata []string               // metadata keys to delete
+	appendNotes   *string                // nil = absent; non-nil = append to issue.Notes
+}
+
+// parseUpdateKVs walks a slice of "key=value" tokens and builds a batchUpdate.
+// Only a small, documented subset of keys is allowed — anything else is a hard
+// error so typos in scripts never silently drop updates. The label, metadata,
+// and notes keys mirror the equivalent single-`bd update` flags (--add-label,
+// --remove-label, --set-metadata, --unset-metadata, --append-notes); their
+// values are resolved against the live issue in runBatchOp.
+func parseUpdateKVs(kvs []string) (*batchUpdate, error) {
+	bu := &batchUpdate{fields: make(map[string]interface{}, len(kvs))}
 	for _, kv := range kvs {
 		eq := strings.IndexByte(kv, '=')
 		if eq <= 0 {
@@ -441,23 +504,45 @@ func parseUpdateKVs(kvs []string) (map[string]interface{}, error) {
 					return nil, fmt.Errorf("update: status cannot be empty")
 				}
 			}
-			updates["status"] = value
+			bu.fields["status"] = value
 		case "priority":
 			p, err := strconv.Atoi(value)
 			if err != nil {
 				return nil, fmt.Errorf("update: invalid priority %q: %w", value, err)
 			}
-			updates["priority"] = p
+			bu.fields["priority"] = p
 		case "title":
 			if strings.TrimSpace(value) == "" {
 				return nil, fmt.Errorf("update: title cannot be empty")
 			}
-			updates["title"] = value
+			bu.fields["title"] = value
 		case "assignee":
-			updates["assignee"] = value
+			bu.fields["assignee"] = value
+		case "add-label":
+			if strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("update: add-label cannot be empty")
+			}
+			bu.addLabels = append(bu.addLabels, value)
+		case "remove-label":
+			if strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("update: remove-label cannot be empty")
+			}
+			bu.removeLabels = append(bu.removeLabels, value)
+		case "set-metadata":
+			// value is itself "metaKey=metaValue"; parsing and key validation
+			// are deferred to applyMetadataEdits so semantics match `bd update`.
+			bu.setMetadata = append(bu.setMetadata, value)
+		case "unset-metadata":
+			if strings.TrimSpace(value) == "" {
+				return nil, fmt.Errorf("update: unset-metadata cannot be empty")
+			}
+			bu.unsetMetadata = append(bu.unsetMetadata, value)
+		case "append-notes":
+			v := value
+			bu.appendNotes = &v
 		default:
-			return nil, fmt.Errorf("update: unsupported key %q (allowed: status, priority, title, assignee)", key)
+			return nil, fmt.Errorf("update: unsupported key %q (allowed: status, priority, title, assignee, add-label, remove-label, set-metadata, unset-metadata, append-notes)", key)
 		}
 	}
-	return updates, nil
+	return bu, nil
 }
