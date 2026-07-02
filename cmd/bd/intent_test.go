@@ -25,7 +25,7 @@ func TestCommandIntentByName_ReadOnlyDefaults(t *testing.T) {
 	// (auto-import, auto-export, tip-metadata commit) all rely on this.
 	readOnly := []string{
 		"list", "ready", "show", "stats", "blocked", "count",
-		"search", "graph", "duplicates", "comments", "current",
+		"search", "query", "graph", "duplicates", "comments", "current",
 		"ping", "backup", "export", "context",
 	}
 	for _, name := range readOnly {
@@ -78,5 +78,24 @@ func TestCommandIntentFor_DispatchesByName(t *testing.T) {
 func TestReadOnlyCommands_MatchesContextCmd(t *testing.T) {
 	if !readOnlyCommands["context"] {
 		t.Fatal("'context' must be classified READ_ONLY in the static map")
+	}
+}
+
+// TestQueryClassifiedReadOnly is a regression guard for ga-n2nh: `bd query` is
+// a pure read (SearchIssues + label/dependency/comment lookups, the direct
+// sibling of `search` and `list`). It MUST classify as read-only so the store
+// opens with cfg.ReadOnly=true and skips syncCLIRemotesToSQL, which shells out
+// to `dolt remote -v` (~0.9s cold dolt CLI) on remote-backed DBs. Misclassifying
+// query as mutating reintroduces that per-invocation cost on every gc path that
+// hits the wisp tier (e.g. gc mail inbox/check/count).
+func TestQueryClassifiedReadOnly(t *testing.T) {
+	if !readOnlyCommands["query"] {
+		t.Fatal("'query' must be classified READ_ONLY in the static map (ga-n2nh)")
+	}
+	if got := commandIntentByName("query"); got != IntentReadOnly {
+		t.Errorf("commandIntentByName(%q) = %v, want IntentReadOnly", "query", got)
+	}
+	if !isReadOnlyCommand("query") {
+		t.Errorf("isReadOnlyCommand(%q) = false, want true", "query")
 	}
 }

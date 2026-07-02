@@ -68,6 +68,7 @@ var readOnlyCommands = map[string]bool{
 	"blocked":    true,
 	"count":      true,
 	"search":     true,
+	"query":      true, // pure read (SearchIssues); sibling of search — skips the dolt remote -v probe (ga-n2nh)
 	"graph":      true,
 	"duplicates": true,
 	"comments":   true, // list comments (not add)
